@@ -1,0 +1,17 @@
+# ESP-IDF Build directories
+/build/
+/managed_components/
+build_*
+sdkconfig.old
+
+# IDE & Editor specific files (Zed, VS Code, etc.)
+.vscode/
+.zed/
+*.swp
+*.swo
+.DS_Store
+
+# Nix generated files (if any local overrides)
+.direnv/
+result
+result-*
