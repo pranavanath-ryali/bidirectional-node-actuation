@@ -1,0 +1,338 @@
+#include "freertos/FreeRTOS.h"
+#include <stdio.h>
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "driver/ledc.h"
+#include "esp_err.h"
+#include "esp_log.h"
+
+#define ENC_A_GPIO   GPIO_NUM_4
+#define ENC_B_GPIO   GPIO_NUM_5
+#define ENC_SW_GPIO  GPIO_NUM_6
+#define COUNTS_PER_DETENT 2
+
+#define SERVO_GPIO   GPIO_NUM_10
+#define SERVO_MIN_US 500     // pulse width for 0 degrees
+#define SERVO_MAX_US 2400    // pulse width for 180 degrees
+
+#define ANGLE_STEP   10                  // degrees per encoder detent
+#define MAX_POS      (180 / ANGLE_STEP) // 36
+#define CENTER_POS   (MAX_POS / 2)      // 18 -> 90 degrees
+
+static const char *TAG = "servo_enc";
+
+static const int8_t qtable[16] = {
+     0, +1, -1,  0,
+    -1,  0,  0, +1,
+    +1,  0,  0, -1,
+     0, -1, +1,  0,
+};
+
+static volatile int32_t position = CENTER_POS;
+static uint8_t prev_state = 0;
+static int8_t accum = 0;
+static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void IRAM_ATTR encoder_isr(void *arg)
+{
+    uint8_t state = (gpio_get_level(ENC_A_GPIO) << 1) | gpio_get_level(ENC_B_GPIO);
+    uint8_t idx = (prev_state << 2) | state;
+    prev_state = state;
+
+    portENTER_CRITICAL_ISR(&mux);
+    accum += qtable[idx];
+    if (accum >= COUNTS_PER_DETENT) {
+        position++;
+        accum = 0;
+    } else if (accum <= -COUNTS_PER_DETENT) {
+        position--;
+        accum = 0;
+    }
+    portEXIT_CRITICAL_ISR(&mux);
+}
+
+static void servo_init(void)
+{
+    ledc_timer_config_t timer_cfg = {
+        .speed_mode      = LEDC_LOW_SPEED_MODE,
+        .timer_num       = LEDC_TIMER_0,
+        .duty_resolution = LEDC_TIMER_14_BIT,
+        .freq_hz         = 50,              // servo standard: 50 Hz (20 ms period)
+        .clk_cfg         = LEDC_AUTO_CLK,
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&timer_cfg));
+
+    ledc_channel_config_t ch_cfg = {
+        .gpio_num   = SERVO_GPIO,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel    = LEDC_CHANNEL_0,
+        .intr_type  = LEDC_INTR_DISABLE,
+        .timer_sel  = LEDC_TIMER_0,
+        .duty       = 0,
+        .hpoint     = 0,
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&ch_cfg));
+}
+
+static void servo_set_angle(int angle)
+{
+    if (angle < 0)   angle = 0;
+    if (angle > 180) angle = 180;
+
+    /* Map 0-180 degrees to a pulse width in microseconds */
+    uint32_t pulse_us = SERVO_MIN_US +
+        (uint32_t)angle * (SERVO_MAX_US - SERVO_MIN_US) / 180;
+
+    /* Convert pulse width to 14-bit duty within the 20 ms period */
+    uint32_t duty = pulse_us * (1U << 14) / 20000;
+
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty));
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0));
+}
+
+void app_main(void)
+{
+    servo_init();
+
+    /* Encoder A and B */
+    gpio_config_t enc_cfg = {
+        .pin_bit_mask = (1ULL << ENC_A_GPIO) | (1ULL << ENC_B_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_ANYEDGE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&enc_cfg));
+
+    prev_state = (gpio_get_level(ENC_A_GPIO) << 1) | gpio_get_level(ENC_B_GPIO);
+
+    ESP_ERROR_CHECK(gpio_install_isr_service(0));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(ENC_A_GPIO, encoder_isr, NULL));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(ENC_B_GPIO, encoder_isr, NULL));
+
+    /* Push button */
+    gpio_config_t btn_cfg = {
+        .pin_bit_mask = 1ULL << ENC_SW_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&btn_cfg));
+
+    int32_t last_pos = -1;   // -1 forces the servo to move on the first pass
+    int btn_last = 1;
+
+    while (1) {
+        /* Clamp position to the valid range and read it */
+        int32_t pos;
+        portENTER_CRITICAL(&mux);
+        if (position < 0)       position = 0;
+        if (position > MAX_POS) position = MAX_POS;
+        pos = position;
+        portEXIT_CRITICAL(&mux);
+
+        if (pos != last_pos) {
+            last_pos = pos;
+            int angle = pos * ANGLE_STEP;
+            servo_set_angle(angle);
+            ESP_LOGI(TAG, "position %ld -> %d deg", (long)pos, angle);
+        }
+
+        /* Button press re-centers the servo */
+        int btn_now = gpio_get_level(ENC_SW_GPIO);
+        if (btn_last == 1 && btn_now == 0) {
+            portENTER_CRITICAL(&mux);
+            position = CENTER_POS;
+            portEXIT_CRITICAL(&mux);
+            ESP_LOGI(TAG, "centered");
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        btn_last = btn_now;
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+// #include "freertos/FreeRTOS.h"
+// #include "freertos/task.h"
+// #include <stdint.h>
+// #include <stdio.h>
+// #include <string.h>
+// #include "freertos/task.h"
+// #include "esp_err.h"
+// #include "esp_event.h"
+// #include "esp_netif.h"
+// #include "esp_now.h"
+// #include "esp_wifi.h"
+// #include "esp_wifi_types_generic.h"
+// #include "nvs_flash.h"
+
+// void recv_cb(const esp_now_recv_info_t *esp_now_info, const uint8_t *data, int data_len) {
+//     char rx_buffer[250];
+//     int len = data_len < sizeof(rx_buffer) - 1 ? data_len : sizeof(rx_buffer) - 1;
+//     memcpy(rx_buffer, data, len);
+//     rx_buffer[len] = '\0';
+
+//     printf("Received: %s\n", rx_buffer);
+// }
+
+// void app_main(void) {
+//     printf("INITIALIZING NODE INTERFACE: C3");
+
+//     nvs_flash_init();
+//     esp_netif_init();
+//     esp_event_loop_create_default();
+//     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+//     esp_wifi_init(&cfg);
+//     esp_wifi_set_mode(WIFI_MODE_STA);
+//     esp_wifi_start();
+
+//     uint8_t mac_addr[8];
+//     esp_wifi_get_mac(WIFI_IF_STA, mac_addr);
+//     printf("--- MAC ADDRESS: %02X:%02X:%02X:%02X:%02X:%02X ---\n",
+//                mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+
+//     if (esp_now_init() != ESP_OK) {
+//         printf("Error initializing ESP-NOW\n");
+//         return;
+//     }
+
+//     esp_now_register_recv_cb(recv_cb);
+//     printf("ESP32-C3 INITIALZED WITH ESP-NOW. Listening\n");
+
+//     while (1) {
+//         vTaskDelay(pdMS_TO_TICKS(200));
+//     }
+// }
+
+
+
+// BIG BACKUP!!!
+#include "freertos/FreeRTOS.h"
+#include <stdio.h>
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "driver/ledc.h"
+#include "esp_err.h"
+#include "esp_log.h"
+
+// SERVO
+#define SERVO_GPIO   GPIO_NUM_10
+#define SERVO_MIN_US 500
+#define SERVO_MAX_US 2400
+
+#define ANGLE_STEP 10
+#define MAX_POS    (180 / ANGLE_STEP)
+#define CENTER_POS (MAX_POS / 2)
+
+// ROTARY ENCODER
+#define ENC_GPIO_A        GPIO_NUM_4
+#define ENC_GPIO_B        GPIO_NUM_5
+#define COUNTS_PER_DETENT 2
+
+static const int8_t qtable[16] = {
+     0, +1, -1,  0,
+    -1,  0,  0, +1,
+    +1,  0,  0, -1,
+     0, -1, +1,  0,
+};
+static volatile int32_t position = CENTER_POS;
+static uint8_t prev_state = 0;
+static int8_t accum = 0;
+static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+
+struct EspNow_ReceivePayload {
+    int angle;
+};
+
+static void IRAM_ATTR encoder_isr(void *arg) {
+    uint8_t state = (gpio_get_level(ENC_GPIO_A) << 1) | gpio_get_level(ENC_GPIO_B);
+    uint8_t idx = (prev_state << 2) | state;
+    prev_state = state;
+
+    portENTER_CRITICAL_ISR(&mux);
+    accum += qtable[idx];
+    if (accum >= COUNTS_PER_DETENT) {
+        position++;
+        accum = 0;
+    } else if (accum <= -COUNTS_PER_DETENT) {
+        position--;
+        accum = 0;
+    }
+    portEXIT_CRITICAL_ISR(&mux);
+}
+
+static inline void encoder_init(void) {
+    gpio_config_t enc_cfg = {
+        .pin_bit_mask = (1ULL << ENC_GPIO_A) | (1ULL << ENC_GPIO_B),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_ANYEDGE
+    };
+    ESP_ERROR_CHECK(gpio_config(&enc_cfg));
+
+    prev_state = (gpio_get_level(ENC_GPIO_A) << 1 | gpio_get_level(ENC_GPIO_B));
+
+    ESP_ERROR_CHECK(gpio_install_isr_service(0));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(ENC_GPIO_A, encoder_isr, NULL));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(ENC_GPIO_B, encoder_isr, NULL));
+}
+
+static inline void servo_init(void) {
+    ledc_timer_config_t timer_cfg = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .timer_num = LEDC_TIMER_0,
+        .duty_resolution = LEDC_TIMER_14_BIT,
+        .freq_hz = 50,
+        .clk_cfg = LEDC_AUTO_CLK
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&timer_cfg));
+
+    ledc_channel_config_t ch_cfg = {
+        .gpio_num = SERVO_GPIO,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_0,
+        .intr_type = LEDC_INTR_DISABLE,
+        .timer_sel = LEDC_TIMER_0,
+        .duty = 0,
+        .hpoint = 0
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&ch_cfg));
+}
+
+static void servo_set_angle(int angle) {
+    if (angle < 0) angle = 0;
+    if (angle > 180) angle = 180;
+
+    uint32_t pulse_us = SERVO_MIN_US + (uint32_t)angle * (SERVO_MAX_US - SERVO_MIN_US) / 180;
+    uint32_t duty = pulse_us * (1U << 14) / 20000;
+
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty));
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0));
+}
+
+void app_main(void) {
+    servo_init();
+    encoder_init();
+
+    uint32_t last_pos = -1;
+    while (1) {
+        int32_t pos;
+        portENTER_CRITICAL(&mux);
+        if (position < 0) position = 0;
+        if (position > MAX_POS) position = MAX_POS;
+        pos = position;
+        portEXIT_CRITICAL(&mux);
+
+        if (pos != last_pos) {
+            last_pos = pos;
+            int angle = pos * ANGLE_STEP;
+            servo_set_angle(angle);
+            ESP_LOGI("SERVO", "Set angle: %d deg", angle);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
