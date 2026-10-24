@@ -1,5 +1,6 @@
 # ESP-IDF Build directories (nested or root)
 **/build/
+**/.cache/
 build/
 /managed_components/
 build_*
