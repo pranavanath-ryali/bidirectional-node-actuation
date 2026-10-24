@@ -14,6 +14,7 @@ sdkconfig.old
 .DS_Store
 
 # Nix generated files
+.envrc
 .direnv/
 result
 result-*
